@@ -25,7 +25,7 @@ const heatmapImageCoordinates = [
 
 // Simulation Parameters
 const SIMULATION_TIME_STEP_MS = 1000;
-const MAX_BURN_DURATION_STEPS = 10;   
+const MAX_BURN_DURATION_STEPS = 5;   
 const NEIGHBOR_SEARCH_RADIUS_DEGREES = 0.0006; 
 const INITIAL_FIRE_STARTS = 3;       
 const BOX_HALF_SIZE_DEGREES = 0.0003; 
@@ -35,15 +35,17 @@ const MINIMUM_EFFECTIVE_CRITICALITY_FOR_SPREAD = 0.525;
 let globalWindSpeedMps = 0; 
 let globalWindDirectionDegrees = null; 
 const WIND_API_URL_TEMPLATE = "https://gis.duk.ac.in/dev/weather/service.php?lat={lat}&lon={lon}";
-const WIND_EFFECT_SCALER = 0.02; 
-const MAX_WIND_BONUS_FACTOR = 0.15;  
+const WIND_EFFECT_SCALER = 0.075; 
+const MAX_WIND_BONUS_FACTOR = 0.9;  // Max positive influence
+const MAX_UPWIND_PENALTY_FACTOR_RATIO = 1.6; // e.g., upwind penalty is at most 0.5 * MAX_WIND_BONUS_FACTOR
+
 let windParticleAnimationId = null; 
 
 // Custom Wind Particle System
 const NUM_WIND_PARTICLES = 200; 
-let windParticles = []; // Array to store particle objects { id, lng, lat, prevLng, prevLat, life, maxLife, speedFactor, opacity }
-const WIND_PARTICLE_BASE_SPEED_FACTOR = 0.0002; 
-const WIND_PARTICLE_TRAIL_LENGTH_SCALE = 8; // Multiplier for how long the "trail" (line segment) is relative to one frame's movement
+let windParticles = []; 
+const WIND_PARTICLE_BASE_SPEED_FACTOR = 0.0004; 
+const WIND_PARTICLE_TRAIL_LENGTH_SCALE = 8; 
 const PARTICLE_MAX_LIFE_FRAMES = 1000; 
 const PARTICLE_MIN_LIFE_FRAMES = 800;  
 
@@ -114,7 +116,7 @@ async function fetchSimulationWindData() {
             console.log(`SIMULATION Global wind updated: Speed ${globalWindSpeedMps.toFixed(1)} m/s, Direction FROM ${globalWindDirectionDegrees !== null ? globalWindDirectionDegrees.toFixed(0) + '°' : 'N/A'}`);
             
             if (windParticles.length === 0 || (data.wind.speed && data.wind.deg)) {
-                 initializeWindParticles(); // Initialize or re-initialize based on new wind
+                 initializeWindParticles();
             }
         } else {
             console.warn("SIMULATION Wind data (data.wind) not found in API response or response structure is unexpected.");
@@ -127,8 +129,7 @@ async function fetchSimulationWindData() {
         globalWindSpeedMps = 0; globalWindDirectionDegrees = null;
         if (windParticles.length === 0) initializeWindParticles(); 
     }
-    // Call visualization update AFTER data is processed and particles potentially re-initialized
-    updateWindParticleVisualization(); 
+    updateWindParticleVisualization();
 }
 
 // --- Custom Wind Particle VISUALIZATION Layer Setup ---
@@ -166,7 +167,6 @@ function initializeWindParticles() {
         resetParticle(i, true); 
     }
     console.log(`Initialized/Reset ${windParticles.length} wind particles.`);
-    // No need to call updateWindParticleVisualization here, it's called by fetch or animate loop start
 }
 
 function resetParticle(index, initialPlacement = false) {
@@ -255,26 +255,20 @@ function animateWindParticles() {
     }
 
     if(particlesUpdated){
-        updateWindParticleVisualization(); // Update the GeoJSON source
+        updateWindParticleVisualization(); 
     }
     
-    // Continue the animation loop
     windParticleAnimationId = requestAnimationFrame(animateWindParticles);
 }
 
 function updateWindParticleVisualization() { 
     const source = map.getSource(windParticleSourceId);
-    if (!source || !map.isStyleLoaded()) { // Also check if style is loaded
-        // console.warn("Custom wind particle source not found or map style not ready for visualization update.");
+    if (!source || !map.isStyleLoaded()) { 
         return; 
     }
      if (windParticles.length === 0 && NUM_WIND_PARTICLES > 0 && map.getSource(windParticleSourceId)) { 
-        // This case should ideally be handled by fetchSimulationWindData or the toggle button logic
-        // to prevent initializing particles if wind data hasn't been fetched yet.
-        // For safety, we can call initialize here, but it's better if data drives initialization.
-        // console.log("Initializing particles from updateWindParticleVisualization as they were empty.");
-        // initializeWindParticles(); 
-        // No, let fetchSimulationWindData or the toggle button handle the first initialization.
+        // This case is mostly handled by fetchSimulationWindData or the toggle button.
+        // Avoid initializing here if it might conflict with an ongoing fetch/initialization.
     }
 
     const features = windParticles.map(p => {
@@ -289,7 +283,7 @@ function updateWindParticleVisualization() {
             trailStartLng = p.lng - dLngPerFrame * WIND_PARTICLE_TRAIL_LENGTH_SCALE;
             trailStartLat = p.lat - dLatPerFrame * WIND_PARTICLE_TRAIL_LENGTH_SCALE;
         } else {
-            trailStartLng = p.lng; // If no wind, line is just a point (or very short)
+            trailStartLng = p.lng; 
             trailStartLat = p.lat;
         }
 
@@ -307,19 +301,12 @@ function updateWindParticleVisualization() {
     });
     
     try {
-        if (map.getSource(windParticleSourceId)) { // Double check source still exists
+        if (map.getSource(windParticleSourceId)) { 
              source.setData({ type: 'FeatureCollection', features: features });
         }
     } catch (error) {
         console.error("Error setting data on wind particle source:", error);
-        // This can happen if the source was removed or map is in a bad state.
     }
-
-    // REMOVED: The recursive call that caused the stack overflow.
-    // The animation loop is self-sustained by requestAnimationFrame in animateWindParticles.
-    // if (windParticlesLayerVisible && !windParticleAnimationId && map.getLayer(windParticleLayerId)) {
-    //     animateWindParticles();
-    // }
 }
 
 
@@ -446,28 +433,43 @@ function runFireSimulationStep() {
                 neighborIndices.forEach(index => {
                     const actualNeighbor = criticalityPoints[index]; 
                     if (actualNeighbor && actualNeighbor.id !== point.id && !actualNeighbor.isBurning && !actualNeighbor.isBurntOut) {
-                        let baseEffectiveCriticality = actualNeighbor.K * Math.max(0.1, 1 - (currentSimulationTimeStep * 0.003)); 
-                        let finalEffectiveCriticality = baseEffectiveCriticality;
                         
-                        if (globalWindSpeedMps > 0 && globalWindDirectionDegrees !== null) {
-                            const dx = actualNeighbor.lng - point.lng; 
-                            const dy = actualNeighbor.lat - point.lat; 
-                            const spreadDistSq = dx*dx + dy*dy;
+                        let baseEffectiveCriticality = actualNeighbor.K * Math.max(0.1, 1 - (currentSimulationTimeStep * 0.003)); 
+                        let finalEffectiveCriticality = baseEffectiveCriticality; // Initialize with base
 
-                            if (spreadDistSq > 0) { 
-                                const spreadDist = Math.sqrt(spreadDistSq);
-                                const windBlowsTowardMathAngleRad = ((270 - globalWindDirectionDegrees + 360) % 360) * Math.PI / 180;
-                                const cosAngleDiff = (dx * Math.cos(windBlowsTowardMathAngleRad) + dy * Math.sin(windBlowsTowardMathAngleRad)) / spreadDist;
-                                
-                                const windInfluence = cosAngleDiff * globalWindSpeedMps * WIND_EFFECT_SCALER;
-                                const cappedWindInfluence = Math.max(-MAX_WIND_BONUS_FACTOR, Math.min(MAX_WIND_BONUS_FACTOR, windInfluence));
-                                
-                                finalEffectiveCriticality = baseEffectiveCriticality + cappedWindInfluence; 
-                                finalEffectiveCriticality = Math.max(0, Math.min(1, finalEffectiveCriticality)); 
+                        // Apply MINIMUM_EFFECTIVE_CRITICALITY_FOR_SPREAD as the first gate
+                        if (baseEffectiveCriticality < MINIMUM_EFFECTIVE_CRITICALITY_FOR_SPREAD) {
+                            finalEffectiveCriticality = 0; // Not inherently spreadable enough
+                        } else {
+                            // If inherently spreadable, then apply wind influence
+                            if (globalWindSpeedMps > 0 && globalWindDirectionDegrees !== null) {
+                                const dx = actualNeighbor.lng - point.lng; 
+                                const dy = actualNeighbor.lat - point.lat; 
+                                const spreadDistSq = dx*dx + dy*dy;
+
+                                if (spreadDistSq > 0) { 
+                                    const spreadDist = Math.sqrt(spreadDistSq);
+                                    const windBlowsTowardMathAngleRad = ((270 - globalWindDirectionDegrees + 360) % 360) * Math.PI / 180;
+                                    const cosAngleDiff = (dx * Math.cos(windBlowsTowardMathAngleRad) + dy * Math.sin(windBlowsTowardMathAngleRad)) / spreadDist;
+                                    
+                                    const rawWindInfluence = cosAngleDiff * globalWindSpeedMps * WIND_EFFECT_SCALER;
+                                    let cappedWindInfluence;
+
+                                    if (rawWindInfluence >= 0) { // Downwind or no strong opposing component
+                                        cappedWindInfluence = Math.min(MAX_WIND_BONUS_FACTOR, rawWindInfluence);
+                                    } else { // Upwind
+                                        // Upwind penalty is reduced by MAX_UPWIND_PENALTY_FACTOR_RATIO
+                                        const maxPenalty = MAX_WIND_BONUS_FACTOR * MAX_UPWIND_PENALTY_FACTOR_RATIO;
+                                        cappedWindInfluence = Math.max(-maxPenalty, rawWindInfluence);
+                                    }
+                                    
+                                    finalEffectiveCriticality = baseEffectiveCriticality + cappedWindInfluence; 
+                                    finalEffectiveCriticality = Math.max(0, Math.min(1, finalEffectiveCriticality)); 
+                                }
                             }
                         }
-
-                        if (finalEffectiveCriticality > MINIMUM_EFFECTIVE_CRITICALITY_FOR_SPREAD && Math.random() < finalEffectiveCriticality) {
+                        // The final check uses the wind-modified (or base, if no wind/not spreadable enough initially) criticality
+                        if (finalEffectiveCriticality > 0 && Math.random() < finalEffectiveCriticality) { // Check final > 0 before random
                             if (!newFiresThisStep.some(p => p.id === actualNeighbor.id)) newFiresThisStep.push(actualNeighbor);
                         }
                     }
@@ -563,12 +565,10 @@ function setupUIControls() {
                     if (globalWindSpeedMps === 0 && globalWindDirectionDegrees === null) { 
                         fetchSimulationWindData(); 
                     }
-                    // Start animation loop if it's not already running
                     if (!windParticleAnimationId) {
                         animateWindParticles(); 
                     }
                  } else {
-                    // Stop animation loop if it's running
                     if (windParticleAnimationId) {
                         cancelAnimationFrame(windParticleAnimationId);
                         windParticleAnimationId = null;
